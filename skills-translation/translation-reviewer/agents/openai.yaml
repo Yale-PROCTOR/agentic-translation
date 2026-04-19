@@ -1,0 +1,4 @@
+interface:
+  display_name: "Translation Reviewer"
+  short_description: "Review C-to-Rust translation changes"
+  default_prompt: "Use $translation-reviewer to review the latest C-to-Rust translation change."

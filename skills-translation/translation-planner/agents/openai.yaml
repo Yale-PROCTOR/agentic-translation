@@ -1,0 +1,4 @@
+interface:
+  display_name: "Translation Planner"
+  short_description: "Plan C-to-Rust translation work"
+  default_prompt: "Use $translation-planner to plan and checkpoint a C-to-Rust translation task."

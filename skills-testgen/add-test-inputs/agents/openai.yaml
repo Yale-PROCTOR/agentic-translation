@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Test Inputs"
+  short_description: "Add argv/stdin JSON inputs for C binary coverage."
+  default_prompt: "Add high-quality test input JSON files for this C binary project."

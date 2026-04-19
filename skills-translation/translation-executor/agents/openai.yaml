@@ -1,0 +1,4 @@
+interface:
+  display_name: "Translation Executor"
+  short_description: "Execute C-to-Rust translation tasks"
+  default_prompt: "Use $translation-executor to implement an assigned C-to-Rust translation task."
