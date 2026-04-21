@@ -65,6 +65,8 @@ def output_data(path: Path) -> dict[str, Any]:
 
 def main() -> None:
     exe = executable()
+    exe_cmd = [f"./{exe.name}"]
+    exe_cwd = exe.parent
     outputs = Path("outputs")
     cov = Path("cov")
     raw = cov / "raw"
@@ -86,10 +88,11 @@ def main() -> None:
         data_path = data_dir / f"{name}.profdata"
         env["LLVM_PROFILE_FILE"] = str(raw_path)
         subprocess.run(
-            [str(exe), *data["argv"]],
+            [*exe_cmd, *data["argv"]],
             input=data["stdin"].encode(),
             capture_output=True,
             env=env,
+            cwd=exe_cwd,
         )
         if not data["ub"]:
             raw_paths.append(raw_path)

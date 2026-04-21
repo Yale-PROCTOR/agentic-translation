@@ -81,9 +81,10 @@ def run_one(exe: Path, data: dict[str, Any]) -> dict[str, Any]:
     start = time.perf_counter()
     try:
         result = subprocess.run(
-            [str(exe), *data["argv"]],
+            [f"./{exe.name}", *data["argv"]],
             input=data["stdin"].encode(),
             capture_output=True,
+            cwd=exe.parent,
             timeout=RUN_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:

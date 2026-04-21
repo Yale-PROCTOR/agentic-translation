@@ -68,6 +68,8 @@ def input_data(path: Path) -> dict[str, Any]:
 
 def main() -> None:
     exe = executable()
+    exe_cmd = [f"./{exe.name}"]
+    exe_cwd = exe.parent
     inputs = Path("inputs")
     outputs = Path("outputs")
     if outputs.exists():
@@ -82,10 +84,11 @@ def main() -> None:
         env["ASAN_OPTIONS"] = "exitcode=86:detect_leaks=0"
         try:
             result = subprocess.run(
-                [str(exe), *data["argv"]],
+                [*exe_cmd, *data["argv"]],
                 input=data["stdin"].encode(),
                 capture_output=True,
                 env=env,
+                cwd=exe_cwd,
                 timeout=60,
             )
         except subprocess.TimeoutExpired:

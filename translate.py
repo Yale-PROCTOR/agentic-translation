@@ -519,12 +519,19 @@ def main() -> None:
     workspace = Path(
         tempfile.mkdtemp(prefix="tmp-", suffix=f"-{archive_name}", dir=".")
     )
-    testgen_dir = workspace / "test_gen"
+    archive_dir = workspace / archive_name
     try:
         run(["git", "init"], cwd=workspace)
-        testgen_dir.mkdir()
+        archive_dir.mkdir()
 
-        extract_archive(archive, testgen_dir)
+        extract_archive(archive, archive_dir)
+        testgen_dir = archive_dir / "test_case"
+        if not testgen_dir.exists():
+            testgen_dir.mkdir()
+            for path in list(archive_dir.iterdir()):
+                if path == testgen_dir:
+                    continue
+                shutil.move(str(path), testgen_dir / path.name)
 
         (testgen_dir / "inputs").mkdir()
         (testgen_dir / "outputs").mkdir()
@@ -547,8 +554,8 @@ def main() -> None:
         executable_name = executable_artifact(testgen_dir / "build-opt").name
         record_runtimes(testgen_dir)
 
-        shutil.move(testgen_dir / "outputs", workspace / "test_vectors")
-        shutil.rmtree(testgen_dir, ignore_errors=True)
+        shutil.copytree(testgen_dir / "outputs", workspace / "test_vectors")
+        shutil.rmtree(archive_dir, ignore_errors=True)
         c_dir = workspace / "c"
         c_dir.mkdir()
         extract_archive(archive, c_dir)
