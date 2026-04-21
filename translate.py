@@ -7,7 +7,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal, Never
 
 START_MESSAGE = "This is the beginning of the whole translation process."
 RETRY_DELAY_SECONDS = 60
@@ -80,7 +80,11 @@ class Abort(Exception):
     pass
 
 
-def abort(message: str) -> None:
+ArtifactKind = Literal["executable", "shared_library"]
+BuildArtifacts = dict[str, tuple[ArtifactKind, Path]]
+
+
+def abort(message: str) -> Never:
     raise Abort(message)
 
 
@@ -97,7 +101,13 @@ def run(command: list[str], cwd: Path) -> None:
     abort("\n".join(parts))
 
 
-def configure(proj_dir: Path, build_dir: str, san: bool, cov: bool, opt: bool) -> None:
+def configure(
+    proj_dir: Path,
+    build_dir: str,
+    san: bool,
+    cov: bool,
+    opt: bool,
+) -> tuple[ArtifactKind, Path]:
     build_path = proj_dir / build_dir
     query_dir = build_path / ".cmake" / "api" / "v1" / "query"
     query_dir.mkdir(parents=True)
@@ -118,15 +128,15 @@ def configure(proj_dir: Path, build_dir: str, san: bool, cov: bool, opt: bool) -
         ],
         cwd=proj_dir,
     )
-    check_artifacts(build_path)
+    return artifact(build_path)
 
 
 def build(proj_dir: Path, build_dir: str) -> None:
     run(["cmake", "--build", build_dir], cwd=proj_dir)
 
 
-def input_json_files(inputs_dir: Path) -> set[Path]:
-    return set(inputs_dir.glob("*.json"))
+def test_input_json_files(inputs_dir: Path) -> set[Path]:
+    return set(inputs_dir.rglob("*.json"))
 
 
 def print_result_error(
@@ -140,7 +150,7 @@ def print_result_error(
         print(f"stdout:\n{result.stdout}", file=sys.stderr)
 
 
-def run_testgen_codex(proj_dir: Path) -> None:
+def run_testgen_codex(workspace: Path) -> None:
     command = [
         "codex",
         "exec",
@@ -150,7 +160,7 @@ def run_testgen_codex(proj_dir: Path) -> None:
         REASONING,
         "--full-auto",
         "-C",
-        str(proj_dir),
+        str(workspace),
         "$add-test-inputs Add test inputs for this project",
     ]
     while True:
@@ -161,12 +171,11 @@ def run_testgen_codex(proj_dir: Path) -> None:
         time.sleep(RETRY_DELAY_SECONDS)
 
 
-def add_test_inputs(proj_dir: Path) -> None:
-    inputs_dir = proj_dir / "inputs"
+def add_test_inputs(workspace: Path, inputs_dir: Path) -> None:
     for _ in range(10):
-        before = input_json_files(inputs_dir)
-        run_testgen_codex(proj_dir)
-        after = input_json_files(inputs_dir)
+        before = test_input_json_files(inputs_dir)
+        run_testgen_codex(workspace)
+        after = test_input_json_files(inputs_dir)
         if not after - before:
             break
 
@@ -377,7 +386,7 @@ def remove_ub_outputs(outputs_dir: Path) -> None:
             output_path.unlink()
 
 
-def executable_artifact(build_path: Path) -> Path:
+def artifact(build_path: Path) -> tuple[ArtifactKind, Path]:
     reply_dir = build_path / ".cmake" / "api" / "v1" / "reply"
     index_path = next(reply_dir.glob("index-*.json"))
     index = load_json(index_path)
@@ -397,16 +406,95 @@ def executable_artifact(build_path: Path) -> Path:
                 elif target_type == "SHARED_LIBRARY":
                     shared_libs.append(path)
 
-    if len(executables) != 1 or shared_libs:
+    if len(executables) == 1 and not shared_libs:
+        return "executable", executables[0]
+    if len(shared_libs) == 1 and not executables:
+        return "shared_library", shared_libs[0]
+    abort(
+        f"{build_path}: expected exactly one executable or exactly one shared library; "
+        f"found {len(executables)} executable(s) and {len(shared_libs)} shared library artifact(s)"
+    )
+
+
+def executable_artifact(build_path: Path) -> Path:
+    kind, path = artifact(build_path)
+    if kind != "executable":
         abort(
-            f"{build_path}: expected exactly one executable and no shared libraries; "
-            f"found {len(executables)} executable(s) and {len(shared_libs)} shared library artifact(s)"
+            f"{build_path}: expected executable artifact, found shared library {path.name}"
         )
-    return executables[0]
+    return path
 
 
 def check_artifacts(build_path: Path) -> None:
-    executable_artifact(build_path)
+    artifact(build_path)
+
+
+def include_dirs(testgen_dir: Path) -> list[Path]:
+    include_paths: set[Path] = set()
+    for path in testgen_dir.rglob("include"):
+        if path.is_dir() and any(path.rglob("*.h")):
+            include_paths.add(path.resolve())
+    return sorted(include_paths)
+
+
+def shared_lib_cmakelists(build_artifacts: BuildArtifacts, testgen_dir: Path) -> str:
+    includes = "\n".join(f'    "{path}"' for path in include_dirs(testgen_dir))
+    return "\n".join(
+        [
+            "cmake_minimum_required(VERSION 3.16)",
+            "project(TestVectors C)",
+            "",
+            "set(CMAKE_C_STANDARD 99)",
+            "",
+            'option(ENABLE_SAN "Enable sanitizers" OFF)',
+            'option(ENABLE_COV "Enable code coverage" OFF)',
+            'option(ENABLE_OPT "Enable optimization" OFF)',
+            "",
+            "if(ENABLE_SAN)",
+            f'  set(MYLIB_PATH "{build_artifacts["build-san"][1]}")',
+            "endif()",
+            "if(ENABLE_COV)",
+            f'  set(MYLIB_PATH "{build_artifacts["build-cov"][1]}")',
+            "endif()",
+            "if(ENABLE_OPT)",
+            f'  set(MYLIB_PATH "{build_artifacts["build-opt"][1]}")',
+            "endif()",
+            "",
+            "set(MYLIB_INCLUDE_DIRS",
+            includes,
+            ")",
+            "",
+            "add_library(mylib SHARED IMPORTED)",
+            "set_target_properties(mylib PROPERTIES",
+            '    IMPORTED_LOCATION "${MYLIB_PATH}"',
+            '    INTERFACE_INCLUDE_DIRECTORIES "${MYLIB_INCLUDE_DIRS}"',
+            ")",
+            "",
+            'get_filename_component(MYLIB_DIR "${MYLIB_PATH}" DIRECTORY)',
+            "",
+            'set(INPUTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/inputs")',
+            'file(GLOB CHILDREN RELATIVE "${INPUTS_DIR}" "${INPUTS_DIR}/*")',
+            "",
+            "foreach(child IN LISTS CHILDREN)",
+            '    if(IS_DIRECTORY "${INPUTS_DIR}/${child}")',
+            '        file(GLOB CFILES "${INPUTS_DIR}/${child}/*.c")',
+            "        list(LENGTH CFILES NUM_CFILES)",
+            "",
+            "        if(NUM_CFILES EQUAL 1)",
+            '            add_executable("${child}" ${CFILES})',
+            '            target_link_libraries("${child}" PRIVATE mylib)',
+            "",
+            '            set_target_properties("${child}" PROPERTIES',
+            '                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"',
+            '                BUILD_RPATH "${MYLIB_DIR}"',
+            "            )",
+            "        endif()",
+            "    endif()",
+            "endforeach()",
+            CMAKE_APPEND.strip(),
+            "",
+        ]
+    )
 
 
 def timed_run(exe: Path, data: dict[str, Any]) -> float:
@@ -459,6 +547,12 @@ def create_rust_project(proj_dir: Path, executable_name: str) -> None:
     (bin_dir / f"{executable_name}.rs").write_text("fn main() {}\n")
     (src_dir / "lib.rs").write_text("")
     (proj_dir / ".gitignore").write_text("/target\n")
+
+
+def executable_name_from_artifact(kind: ArtifactKind, path: Path) -> str:
+    if kind == "executable":
+        return path.name
+    return path.name.removeprefix("lib").split(".", 1)[0]
 
 
 def write_translation_workspace(workspace: Path, root_dir: Path) -> None:
@@ -533,28 +627,70 @@ def main() -> None:
                     continue
                 shutil.move(str(path), testgen_dir / path.name)
 
-        (testgen_dir / "inputs").mkdir()
-        (testgen_dir / "outputs").mkdir()
-        shutil.copy2(root_dir / "run_with_cov.py", testgen_dir)
-        shutil.copy2(root_dir / "run_with_san.py", testgen_dir)
-        shutil.copy2(root_dir / "mutate.py", testgen_dir)
         (testgen_dir / "CMakeLists.txt").open("a").write(CMAKE_APPEND)
-
-        configure(testgen_dir, "build-san", san=True, cov=False, opt=False)
-        configure(testgen_dir, "build-cov", san=False, cov=True, opt=False)
+        build_artifacts: BuildArtifacts = {
+            "build-san": configure(
+                testgen_dir,
+                "build-san",
+                san=True,
+                cov=False,
+                opt=False,
+            ),
+            "build-cov": configure(
+                testgen_dir,
+                "build-cov",
+                san=False,
+                cov=True,
+                opt=False,
+            ),
+            "build-opt": configure(
+                testgen_dir,
+                "build-opt",
+                san=False,
+                cov=False,
+                opt=True,
+            ),
+        }
         build(testgen_dir, "build-san")
         build(testgen_dir, "build-cov")
-        shutil.copytree(root_dir / "skills-testgen", testgen_dir / ".codex" / "skills")
-        if not no_codex:
-            add_test_inputs(testgen_dir)
-        remove_ub_outputs(testgen_dir / "outputs")
-
-        configure(testgen_dir, "build-opt", san=False, cov=False, opt=True)
         build(testgen_dir, "build-opt")
-        executable_name = executable_artifact(testgen_dir / "build-opt").name
-        record_runtimes(testgen_dir)
+        artifact_kind, build_artifact = build_artifacts["build-opt"]
+        executable_name = executable_name_from_artifact(artifact_kind, build_artifact)
+        test_vectors_dir = workspace / "test_vectors"
+        if artifact_kind == "executable":
+            (testgen_dir / "inputs").mkdir()
+            (testgen_dir / "outputs").mkdir()
+            shutil.copy2(root_dir / "run_with_cov.py", testgen_dir)
+            shutil.copy2(root_dir / "run_with_san.py", testgen_dir)
+            shutil.copy2(root_dir / "mutate.py", testgen_dir)
+            shutil.copytree(
+                root_dir / "skills-testgen", testgen_dir / ".codex" / "skills"
+            )
+            if not no_codex:
+                add_test_inputs(testgen_dir, testgen_dir / "inputs")
+            remove_ub_outputs(testgen_dir / "outputs")
+            record_runtimes(testgen_dir)
+            shutil.copytree(testgen_dir / "outputs", test_vectors_dir)
+        else:
+            test_vectors_dir.mkdir()
+            (test_vectors_dir / "CMakeLists.txt").write_text(
+                shared_lib_cmakelists(build_artifacts, testgen_dir)
+            )
+            (test_vectors_dir / "inputs").mkdir()
+            (test_vectors_dir / "outputs").mkdir()
+            shutil.copy2(
+                root_dir / "run_with_san_lib.py", workspace / "run_with_san.py"
+            )
+            shutil.copy2(
+                root_dir / "run_with_cov_lib.py", workspace / "run_with_cov.py"
+            )
+            shutil.copytree(
+                root_dir / "skills-testgen-lib", workspace / ".codex" / "skills"
+            )
+            if not no_codex:
+                add_test_inputs(workspace, test_vectors_dir / "inputs")
+            exit(0)
 
-        shutil.copytree(testgen_dir / "outputs", workspace / "test_vectors")
         shutil.rmtree(archive_dir, ignore_errors=True)
         c_dir = workspace / "c"
         c_dir.mkdir()

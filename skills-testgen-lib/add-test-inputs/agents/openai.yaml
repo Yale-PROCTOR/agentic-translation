@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add Test Inputs"
+  short_description: "Add shared-library harnesses and argv/stdin JSON inputs."
+  default_prompt: "Add high-quality shared-library test vectors for this C project."

@@ -64,15 +64,14 @@ def mutated_strings(value: str) -> list[str]:
 
 
 def mutated_lists(values: list[str]) -> list[list[str]]:
-    return [
-        values[:index] + values[index + 1 :]
-        for index in range(len(values))
-    ] + [
-        [*values, "a"]
-    ] + [
-        values[:index] + [values[index + 1], values[index]] + values[index + 2 :]
-        for index in range(len(values) - 1)
-    ]
+    return (
+        [values[:index] + values[index + 1 :] for index in range(len(values))]
+        + [[*values, "a"]]
+        + [
+            values[:index] + [values[index + 1], values[index]] + values[index + 2 :]
+            for index in range(len(values) - 1)
+        ]
+    )
 
 
 def mutants(data: dict[str, Any]) -> list[dict[str, Any]]:
