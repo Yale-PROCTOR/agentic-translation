@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -63,6 +62,15 @@ def output_data(path: Path) -> dict[str, Any]:
     return data
 
 
+def is_fresh(output_path: Path, inputs: list[Path]) -> bool:
+    if not output_path.exists():
+        return False
+    output_mtime = output_path.stat().st_mtime_ns
+    return all(
+        path.exists() and path.stat().st_mtime_ns <= output_mtime for path in inputs
+    )
+
+
 def main() -> None:
     exe = executable()
     exe_cmd = [f"./{exe.name}"]
@@ -72,89 +80,113 @@ def main() -> None:
     raw = cov / "raw"
     data_dir = cov / "data"
     show = cov / "show"
-    if cov.exists():
-        shutil.rmtree(cov)
     raw.mkdir(parents=True)
-    data_dir.mkdir()
-    show.mkdir()
+    data_dir.mkdir(exist_ok=True)
+    show.mkdir(exist_ok=True)
     raw_paths: list[Path] = []
+    any_changed = False
 
     for output_path in outputs.glob("*.json"):
-        print(f"Running {exe} with output {output_path}...")
         data = output_data(output_path)
         name = output_path.stem
         env = os.environ.copy()
         raw_path = raw / f"{name}.profraw"
         data_path = data_dir / f"{name}.profdata"
-        env["LLVM_PROFILE_FILE"] = str(raw_path)
-        subprocess.run(
-            [*exe_cmd, *data["argv"]],
-            input=data["stdin"].encode(),
-            capture_output=True,
-            env=env,
-            cwd=exe_cwd,
-        )
+        show_path = show / f"{name}.txt"
+        if is_fresh(raw_path, [output_path, exe]):
+            print(f"Keeping {raw_path}...")
+        else:
+            print(f"Running {exe} with output {output_path}...")
+            env["LLVM_PROFILE_FILE"] = str(raw_path)
+            subprocess.run(
+                [*exe_cmd, *data["argv"]],
+                input=data["stdin"].encode(),
+                capture_output=True,
+                env=env,
+                cwd=exe_cwd,
+            )
+            any_changed = True
         if not data["ub"]:
             raw_paths.append(raw_path)
+        if is_fresh(data_path, [raw_path]):
+            print(f"Keeping {data_path}...")
+        else:
+            subprocess.run(
+                [
+                    "llvm-profdata-20",
+                    "merge",
+                    "-sparse",
+                    str(raw_path),
+                    "-o",
+                    str(data_path),
+                ],
+                check=True,
+            )
+            any_changed = True
+        if is_fresh(show_path, [data_path, exe]):
+            print(f"Keeping {show_path}...")
+        else:
+            with show_path.open("w") as stdout:
+                subprocess.run(
+                    [
+                        "llvm-cov-20",
+                        "show",
+                        str(exe),
+                        f"-instr-profile={data_path}",
+                        "-show-line-counts-or-regions",
+                    ],
+                    check=True,
+                    stdout=stdout,
+                )
+            any_changed = True
+
+    merged_path = cov / "merged.profdata"
+    merged_show_path = cov / "merged.txt"
+    report_path = cov / "report.txt"
+    if not is_fresh(merged_path, raw_paths):
         subprocess.run(
             [
                 "llvm-profdata-20",
                 "merge",
                 "-sparse",
-                str(raw_path),
+                *map(str, raw_paths),
                 "-o",
-                str(data_path),
+                str(merged_path),
             ],
             check=True,
         )
-        with (show / f"{name}.txt").open("w") as stdout:
+        any_changed = True
+    else:
+        print(f"Keeping {merged_path}...")
+    if any_changed or not is_fresh(merged_show_path, [merged_path, exe]):
+        with merged_show_path.open("w") as stdout:
             subprocess.run(
                 [
                     "llvm-cov-20",
                     "show",
                     str(exe),
-                    f"-instr-profile={data_path}",
+                    f"-instr-profile={merged_path}",
                     "-show-line-counts-or-regions",
                 ],
                 check=True,
                 stdout=stdout,
             )
-
-    merged_path = cov / "merged.profdata"
-    subprocess.run(
-        [
-            "llvm-profdata-20",
-            "merge",
-            "-sparse",
-            *map(str, raw_paths),
-            "-o",
-            str(merged_path),
-        ],
-        check=True,
-    )
-    with (cov / "merged.txt").open("w") as stdout:
-        subprocess.run(
-            [
-                "llvm-cov-20",
-                "show",
-                str(exe),
-                f"-instr-profile={merged_path}",
-                "-show-line-counts-or-regions",
-            ],
-            check=True,
-            stdout=stdout,
-        )
-    with (cov / "report.txt").open("w") as stdout:
-        subprocess.run(
-            [
-                "llvm-cov-20",
-                "report",
-                str(exe),
-                f"-instr-profile={merged_path}",
-            ],
-            check=True,
-            stdout=stdout,
-        )
+    else:
+        print(f"Keeping {merged_show_path}...")
+    if any_changed or not is_fresh(report_path, [merged_path, exe]):
+        with report_path.open("w") as stdout:
+            subprocess.run(
+                [
+                    "llvm-cov-20",
+                    "report",
+                    str(exe),
+                    f"-instr-profile={merged_path}",
+                ],
+                check=True,
+                stdout=stdout,
+            )
+    else:
+        print(f"Keeping {report_path}...")
 
 
 if __name__ == "__main__":

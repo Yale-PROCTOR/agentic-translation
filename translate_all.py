@@ -12,6 +12,8 @@ def main() -> None:
     for test_dir in sorted(path for path in public_dir.glob("*/*") if path.is_dir()):
         if "P01_" in test_dir.as_posix():
             continue
+        if (test_dir / "translated_rust").exists():
+            continue
 
         bundle = bundle_dir / test_dir.relative_to(public_dir).with_suffix(".tar.gz")
         if bundle.is_file():

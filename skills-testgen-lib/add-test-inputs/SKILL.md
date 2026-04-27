@@ -44,7 +44,7 @@ Add focused shared-library test vectors without changing library source, generat
 
 5. Validate with sanitizers.
    - Run `./run_with_san.py`.
-   - The script runs each harness executable from its case directory, and writes output JSON files under `test_vectors/outputs/<case>/`.
+   - The script runs each harness executable in an isolated temporary working directory, and writes output JSON files under `test_vectors/outputs/<case>/`.
    - Continue only when the script exits successfully.
 
 6. Validate coverage.
@@ -62,7 +62,8 @@ Add focused shared-library test vectors without changing library source, generat
 - Prefer vectors that make the harness call the shared library in meaningfully different ways.
 - Use separate harnesses for meaningfully different call sequences, and JSON inputs for variations within one call sequence.
 - Do not assert outputs in the harness.
-- Make the harness print every relevant function output so it is captured in output JSON files, including return values and updated pointer arguments.
+- Make the harness write every relevant function output to `test-vector-output.log`, including return values and updated pointer arguments.
+- Do not print library-call output to `stdout` or `stderr`, to avoid interleaving with output produced by the library itself.
 - Keep harnesses minimal and deterministic.
 - Keep case and input names stable and descriptive, such as `parse-header/empty.json` or `init-twice/repeat-call.json`.
 - Ensure each case directory still contains exactly one `.c` file.

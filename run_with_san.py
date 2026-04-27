@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -66,19 +65,30 @@ def input_data(path: Path) -> dict[str, Any]:
     return data
 
 
+def is_fresh(output_path: Path, inputs: list[Path]) -> bool:
+    if not output_path.exists():
+        return False
+    output_mtime = output_path.stat().st_mtime_ns
+    return all(
+        path.exists() and path.stat().st_mtime_ns <= output_mtime for path in inputs
+    )
+
+
 def main() -> None:
     exe = executable()
     exe_cmd = [f"./{exe.name}"]
     exe_cwd = exe.parent
     inputs = Path("inputs")
     outputs = Path("outputs")
-    if outputs.exists():
-        shutil.rmtree(outputs)
     outputs.mkdir(exist_ok=True)
 
     for arg in inputs.iterdir():
-        print(f"Running {exe} with input {arg}...")
         input_path = Path(arg)
+        output_path = outputs / input_path.name
+        if is_fresh(output_path, [input_path, exe]):
+            print(f"Keeping {output_path}...")
+            continue
+        print(f"Running {exe} with input {arg}...")
         data = input_data(input_path)
         env = os.environ.copy()
         env["ASAN_OPTIONS"] = "exitcode=86:detect_leaks=0"
@@ -102,7 +112,7 @@ def main() -> None:
             "exitcode": result.returncode,
             "ub": result.returncode == 86,
         }
-        (outputs / input_path.name).write_text(json.dumps(output))
+        output_path.write_text(json.dumps(output))
 
 
 if __name__ == "__main__":

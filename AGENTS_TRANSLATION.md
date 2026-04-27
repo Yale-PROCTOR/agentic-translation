@@ -1,6 +1,8 @@
 # Goal
 
 Translate `c` from C to Rust in `translated_rust`.
+When translating a library, preserve the exposed library API functions declared under `.h` files in `include` directories. Use the correct function names. If function name identifiers are expanded by macros, the names expected by the binary may differ from what appears in the C source, and you should use the exact names linked to the binary.
+Implement library functionality mostly in Safe Rust. If needed for ABI compatibility, define wrapper functions with Unsafe Rust.
 
 ## Validation
 

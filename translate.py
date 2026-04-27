@@ -14,11 +14,13 @@ RETRY_DELAY_SECONDS = 60
 MODEL = "gpt-5.4"
 REASONING = "model_reasoning_effort = medium"
 
-CMAKE_APPEND = """
+CMAKE_OPTIONS = """
 option(ENABLE_SAN "Enable sanitizers" OFF)
 option(ENABLE_COV "Enable code coverage" OFF)
 option(ENABLE_OPT "Enable optimization" OFF)
+"""
 
+CMAKE_TARGET_OPTIONS = """
 if(ENABLE_SAN)
     message(STATUS "Sanitizers enabled")
     get_property(_translation_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
@@ -74,6 +76,8 @@ if(ENABLE_OPT)
     endforeach()
 endif()
 """
+
+CMAKE_APPEND = f"{CMAKE_OPTIONS.rstrip()}\n\n{CMAKE_TARGET_OPTIONS.strip()}\n"
 
 
 class Abort(Exception):
@@ -380,10 +384,17 @@ def extract_archive(archive: Path, proj_dir: Path) -> None:
         tar.extractall(proj_dir)
 
 
+def output_json_paths(outputs_dir: Path) -> list[Path]:
+    return sorted(outputs_dir.rglob("*.json"))
+
+
 def remove_ub_outputs(outputs_dir: Path) -> None:
-    for output_path in outputs_dir.glob("*.json"):
+    for output_path in output_json_paths(outputs_dir):
         if load_json(output_path)["ub"]:
             output_path.unlink()
+    for directory in sorted(outputs_dir.rglob("*"), reverse=True):
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
 
 
 def artifact(build_path: Path) -> tuple[ArtifactKind, Path]:
@@ -437,8 +448,21 @@ def include_dirs(testgen_dir: Path) -> list[Path]:
     return sorted(include_paths)
 
 
-def shared_lib_cmakelists(build_artifacts: BuildArtifacts, testgen_dir: Path) -> str:
-    includes = "\n".join(f'    "{path}"' for path in include_dirs(testgen_dir))
+def include_dirs_block(root: Path) -> list[str]:
+    paths = include_dirs(root)
+    if not paths:
+        return ["set(MYLIB_INCLUDE_DIRS)"]
+    return [
+        "set(MYLIB_INCLUDE_DIRS",
+        *(f'    "{path}"' for path in paths),
+        ")",
+    ]
+
+
+def shared_lib_testgen_cmakelists(
+    build_artifacts: BuildArtifacts, testgen_dir: Path
+) -> str:
+    includes = include_dirs_block(testgen_dir)
     return "\n".join(
         [
             "cmake_minimum_required(VERSION 3.16)",
@@ -446,9 +470,7 @@ def shared_lib_cmakelists(build_artifacts: BuildArtifacts, testgen_dir: Path) ->
             "",
             "set(CMAKE_C_STANDARD 99)",
             "",
-            'option(ENABLE_SAN "Enable sanitizers" OFF)',
-            'option(ENABLE_COV "Enable code coverage" OFF)',
-            'option(ENABLE_OPT "Enable optimization" OFF)',
+            CMAKE_OPTIONS.strip(),
             "",
             "if(ENABLE_SAN)",
             f'  set(MYLIB_PATH "{build_artifacts["build-san"][1]}")',
@@ -460,9 +482,7 @@ def shared_lib_cmakelists(build_artifacts: BuildArtifacts, testgen_dir: Path) ->
             f'  set(MYLIB_PATH "{build_artifacts["build-opt"][1]}")',
             "endif()",
             "",
-            "set(MYLIB_INCLUDE_DIRS",
-            includes,
-            ")",
+            *includes,
             "",
             "add_library(mylib SHARED IMPORTED)",
             "set_target_properties(mylib PROPERTIES",
@@ -491,25 +511,91 @@ def shared_lib_cmakelists(build_artifacts: BuildArtifacts, testgen_dir: Path) ->
             "        endif()",
             "    endif()",
             "endforeach()",
-            CMAKE_APPEND.strip(),
+            CMAKE_TARGET_OPTIONS.strip(),
+            "",
+        ]
+    )
+
+
+def translated_shared_lib_path(workspace: Path, artifact_name: str, opt: bool) -> Path:
+    profile = "release" if opt else "debug"
+    return (
+        workspace / "translated_rust" / "target" / profile / f"lib{artifact_name}.so"
+    ).resolve()
+
+
+def shared_lib_workspace_cmakelists(workspace: Path, artifact_name: str) -> str:
+    includes = include_dirs_block(workspace / "c")
+    debug_lib = translated_shared_lib_path(workspace, artifact_name, opt=False)
+    release_lib = translated_shared_lib_path(workspace, artifact_name, opt=True)
+    return "\n".join(
+        [
+            "cmake_minimum_required(VERSION 3.16)",
+            "project(TestVectors C)",
+            "",
+            "set(CMAKE_C_STANDARD 99)",
+            "",
+            'option(ENABLE_OPT "Enable optimization" OFF)',
+            "",
+            "if(ENABLE_OPT)",
+            f'  set(MYLIB_PATH "{release_lib}")',
+            "else()",
+            f'  set(MYLIB_PATH "{debug_lib}")',
+            "endif()",
+            "",
+            *includes,
+            "",
+            "add_library(mylib SHARED IMPORTED)",
+            "set_target_properties(mylib PROPERTIES",
+            '    IMPORTED_LOCATION "${MYLIB_PATH}"',
+            '    INTERFACE_INCLUDE_DIRECTORIES "${MYLIB_INCLUDE_DIRS}"',
+            ")",
+            "",
+            'get_filename_component(MYLIB_DIR "${MYLIB_PATH}" DIRECTORY)',
+            "",
+            'set(INPUTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/inputs")',
+            'file(GLOB CHILDREN RELATIVE "${INPUTS_DIR}" "${INPUTS_DIR}/*")',
+            "",
+            "foreach(child IN LISTS CHILDREN)",
+            '  if(IS_DIRECTORY "${INPUTS_DIR}/${child}")',
+            '    file(GLOB CFILES "${INPUTS_DIR}/${child}/*.c")',
+            "    list(LENGTH CFILES NUM_CFILES)",
+            "    if(NUM_CFILES EQUAL 1)",
+            '      add_executable("${child}" ${CFILES})',
+            '      target_link_libraries("${child}" PRIVATE mylib)',
+            "      if(ENABLE_OPT)",
+            '        target_compile_options("${child}" PRIVATE -O3)',
+            "      endif()",
+            '      set_target_properties("${child}" PROPERTIES',
+            '        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"',
+            '        BUILD_RPATH "${MYLIB_DIR}"',
+            "      )",
+            "    endif()",
+            "  endif()",
+            "endforeach()",
             "",
         ]
     )
 
 
 def timed_run(exe: Path, data: dict[str, Any]) -> float:
-    start = time.perf_counter_ns()
-    subprocess.run(
-        [str(exe), *data["argv"]],
-        input=data["stdin"].encode(),
-        capture_output=True,
-    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        temp_exe = temp_path / exe.name
+        shutil.copy2(exe, temp_exe)
+        start = time.perf_counter_ns()
+        subprocess.run(
+            [f"./{temp_exe.name}", *data["argv"]],
+            input=data["stdin"].encode(),
+            capture_output=True,
+            cwd=temp_path,
+        )
     return (time.perf_counter_ns() - start) / 1_000_000_000
 
 
 def record_runtimes(proj_dir: Path) -> None:
     exe = executable_artifact(proj_dir / "build-opt")
-    for output_path in (proj_dir / "outputs").glob("*.json"):
+    for output_path in output_json_paths(proj_dir / "outputs"):
         data = load_json(output_path)
         runtimes = [timed_run(exe, data)]
         if runtimes[0] < 5:
@@ -522,43 +608,123 @@ def record_runtimes(proj_dir: Path) -> None:
         output_path.write_text(json.dumps(data))
 
 
-def create_rust_project(proj_dir: Path, executable_name: str) -> None:
+def record_shared_lib_runtimes(test_vectors_dir: Path) -> None:
+    outputs_dir = test_vectors_dir / "outputs"
+    run(
+        [
+            "cmake",
+            "-S",
+            ".",
+            "-B",
+            "./build-opt",
+            "-G",
+            "Ninja",
+            "-DCMAKE_C_COMPILER=clang-20",
+            "-DENABLE_SAN=OFF",
+            "-DENABLE_COV=OFF",
+            "-DENABLE_OPT=ON",
+        ],
+        cwd=test_vectors_dir,
+    )
+    run(["cmake", "--build", "build-opt"], cwd=test_vectors_dir)
+    bin_dir = test_vectors_dir / "build-opt" / "bin"
+    for case_dir in sorted(path for path in outputs_dir.iterdir() if path.is_dir()):
+        exe = bin_dir / case_dir.name
+        for output_path in output_json_paths(case_dir):
+            data = load_json(output_path)
+            runtimes = [timed_run(exe, data)]
+            if runtimes[0] < 5:
+                extra_runs = int(min(10, 10 / runtimes[0])) - 1
+            else:
+                extra_runs = 1
+            runtimes.extend(timed_run(exe, data) for _ in range(extra_runs))
+            data["runtimes"] = runtimes
+            data["average_runtime"] = sum(runtimes) / len(runtimes)
+            output_path.write_text(json.dumps(data))
+
+
+def finalize_shared_lib_outputs(test_vectors_dir: Path) -> None:
+    outputs_dir = test_vectors_dir / "outputs"
+    inputs_dir = test_vectors_dir / "inputs"
+    remove_ub_outputs(outputs_dir)
+    record_shared_lib_runtimes(test_vectors_dir)
+    for input_path in output_json_paths(inputs_dir):
+        input_path.unlink()
+    for output_path in output_json_paths(outputs_dir):
+        case_dir = inputs_dir / output_path.parent.name
+        destination = case_dir / output_path.name
+        if destination.exists():
+            destination.unlink()
+        output_path.replace(destination)
+    shutil.rmtree(outputs_dir, ignore_errors=True)
+    shutil.rmtree(test_vectors_dir / "cov", ignore_errors=True)
+    shutil.rmtree(test_vectors_dir / "build-san", ignore_errors=True)
+    shutil.rmtree(test_vectors_dir / "build-cov", ignore_errors=True)
+    shutil.rmtree(test_vectors_dir / "build-opt", ignore_errors=True)
+
+
+def create_rust_project(
+    proj_dir: Path, artifact_name: str, artifact_kind: ArtifactKind
+) -> None:
     src_dir = proj_dir / "src"
-    bin_dir = src_dir / "bin"
-    bin_dir.mkdir(parents=True)
-    (proj_dir / "Cargo.toml").write_text(
-        "\n".join(
+    src_dir.mkdir(parents=True)
+    cargo_toml_lines = [
+        "[package]",
+        f'name = "{artifact_name}"',
+        'edition = "2024"',
+        "",
+        "[workspace]",
+        "",
+    ]
+    if artifact_kind == "shared_library":
+        cargo_toml_lines.extend(
             [
-                "[package]",
-                f'name = "{executable_name}"',
-                'edition = "2024"',
-                "",
-                "[workspace]",
-                "",
-                "[dependencies]",
-                'bytemuck = "1.25.0"',
-                'lazy_static = "1.5.0"',
-                'xj_scanf = "0.2.2"',
+                "[lib]",
+                'crate-type = ["cdylib"]',
                 "",
             ]
         )
+    cargo_toml_lines.extend(
+        [
+            "[dependencies]",
+            'bytemuck = "1.25.0"',
+            'lazy_static = "1.5.0"',
+            'xj_scanf = "0.2.2"',
+            "",
+        ]
     )
+    (proj_dir / "Cargo.toml").write_text("\n".join(cargo_toml_lines))
     (proj_dir / "rust-toolchain").write_text("nightly-2025-11-11\n")
-    (bin_dir / f"{executable_name}.rs").write_text("fn main() {}\n")
+    if artifact_kind == "executable":
+        bin_dir = src_dir / "bin"
+        bin_dir.mkdir()
+        (bin_dir / f"{artifact_name}.rs").write_text("fn main() {}\n")
     (src_dir / "lib.rs").write_text("")
     (proj_dir / ".gitignore").write_text("/target\n")
 
 
-def executable_name_from_artifact(kind: ArtifactKind, path: Path) -> str:
+def name_of_artifact(kind: ArtifactKind, path: Path) -> str:
     if kind == "executable":
         return path.name
     return path.name.removeprefix("lib").split(".", 1)[0]
 
 
-def write_translation_workspace(workspace: Path, root_dir: Path) -> None:
+def adapt_agents_file(path: Path, artifact_kind: ArtifactKind) -> None:
+    if artifact_kind != "executable":
+        return
+    lines = path.read_text().splitlines()
+    path.write_text("\n".join(line for i, line in enumerate(lines) if i not in {3, 4}) + "\n")
+
+
+def write_translation_workspace(
+    workspace: Path, root_dir: Path, artifact_kind: ArtifactKind
+) -> None:
     shutil.copytree(root_dir / "skills-translation", workspace / ".codex" / "skills")
-    shutil.copy2(root_dir / "AGENTS_TRANSLATION.md", workspace / "AGENTS.md")
-    shutil.copy2(root_dir / "test.py", workspace / "test.py")
+    agents_path = workspace / "AGENTS.md"
+    shutil.copy2(root_dir / "AGENTS_TRANSLATION.md", agents_path)
+    adapt_agents_file(agents_path, artifact_kind)
+    test_script = "test_lib.py" if artifact_kind == "shared_library" else "test.py"
+    shutil.copy2(root_dir / test_script, workspace / "test.py")
     write_agent_schemas(workspace)
     text = (
         "This is the beginning of the whole translation process, "
@@ -655,7 +821,7 @@ def main() -> None:
         build(testgen_dir, "build-cov")
         build(testgen_dir, "build-opt")
         artifact_kind, build_artifact = build_artifacts["build-opt"]
-        executable_name = executable_name_from_artifact(artifact_kind, build_artifact)
+        artifact_name = name_of_artifact(artifact_kind, build_artifact)
         test_vectors_dir = workspace / "test_vectors"
         if artifact_kind == "executable":
             (testgen_dir / "inputs").mkdir()
@@ -674,7 +840,7 @@ def main() -> None:
         else:
             test_vectors_dir.mkdir()
             (test_vectors_dir / "CMakeLists.txt").write_text(
-                shared_lib_cmakelists(build_artifacts, testgen_dir)
+                shared_lib_testgen_cmakelists(build_artifacts, testgen_dir)
             )
             (test_vectors_dir / "inputs").mkdir()
             (test_vectors_dir / "outputs").mkdir()
@@ -689,17 +855,25 @@ def main() -> None:
             )
             if not no_codex:
                 add_test_inputs(workspace, test_vectors_dir / "inputs")
-            exit(0)
+            finalize_shared_lib_outputs(test_vectors_dir)
 
         shutil.rmtree(archive_dir, ignore_errors=True)
+        shutil.rmtree(workspace / ".codex", ignore_errors=True)
+        (workspace / "run_with_san.py").unlink(missing_ok=True)
+        (workspace / "run_with_cov.py").unlink(missing_ok=True)
+
         c_dir = workspace / "c"
         c_dir.mkdir()
         extract_archive(archive, c_dir)
         rust_dir = workspace / "translated_rust"
         rust_dir.mkdir()
-        create_rust_project(rust_dir, executable_name)
+        create_rust_project(rust_dir, artifact_name, artifact_kind)
         run(["cargo", "build"], cwd=rust_dir)
-        write_translation_workspace(workspace, root_dir)
+        if artifact_kind == "shared_library":
+            (test_vectors_dir / "CMakeLists.txt").write_text(
+                shared_lib_workspace_cmakelists(workspace, artifact_name)
+            )
+        write_translation_workspace(workspace, root_dir, artifact_kind)
         commit_initial_workspace(workspace)
 
         if not no_codex:

@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ def load_json(path: Path) -> Any:
         abort(f"{path}: invalid JSON: {exc}")
 
 
-def require_input_data(path: Path) -> dict[str, Any]:
+def require_case_data(path: Path) -> dict[str, Any]:
     data = load_json(path)
     if not isinstance(data, dict):
         abort(f"{path}: expected JSON object")
@@ -30,13 +31,6 @@ def require_input_data(path: Path) -> dict[str, Any]:
         abort(f"{path}: expected argv to contain only strings")
     if not isinstance(data.get("stdin"), str):
         abort(f"{path}: expected stdin string")
-    return data
-
-
-def require_output_data(path: Path) -> dict[str, Any]:
-    data = load_json(path)
-    if not isinstance(data, dict):
-        abort(f"{path}: expected JSON object")
     if not isinstance(data.get("ub"), bool):
         abort(f"{path}: expected ub boolean")
     return data
@@ -48,29 +42,32 @@ def test_vectors_dir() -> Path:
         abort(f"{root}: test_vectors directory does not exist")
     if not (root / "CMakeLists.txt").is_file():
         abort(f"{root / 'CMakeLists.txt'}: file does not exist")
-    if not (root / "inputs").is_dir():
-        abort(f"{root / 'inputs'}: directory does not exist")
     if not (root / "outputs").is_dir():
         abort(f"{root / 'outputs'}: directory does not exist")
     return root
 
 
-def test_case_dirs(root: Path) -> list[Path]:
-    inputs_dir = root / "inputs"
-    paths = sorted(path for path in inputs_dir.iterdir() if path.is_dir())
+def output_case_dirs(root: Path) -> list[Path]:
+    outputs_dir = root / "outputs"
+    paths = sorted(path for path in outputs_dir.iterdir() if path.is_dir())
     if not paths:
-        abort(f"{inputs_dir}: expected at least one test case subdirectory")
+        abort(f"{outputs_dir}: expected at least one test case subdirectory")
     return paths
 
 
-def validate_test_case_dir(path: Path) -> list[Path]:
-    c_files = sorted(path.glob("*.c"))
+def output_case_paths(path: Path) -> list[Path]:
     json_files = sorted(path.glob("*.json"))
-    if len(c_files) != 1:
-        abort(f"{path}: expected exactly one .c file, found {len(c_files)}")
     if not json_files:
         abort(f"{path}: expected at least one .json file")
     return json_files
+
+
+def harness_path(root: Path, case_name: str) -> Path:
+    path = root / "inputs" / case_name
+    c_files = sorted(path.glob("*.c"))
+    if len(c_files) != 1:
+        abort(f"{path}: expected exactly one .c file, found {len(c_files)}")
+    return c_files[0]
 
 
 def shared_lib_path(root: Path) -> Path:
@@ -95,18 +92,30 @@ def shared_lib_path(root: Path) -> Path:
     abort(f"{root / 'CMakeLists.txt'}: ENABLE_COV MYLIB_PATH not found")
 
 
-def run_case(exe_path: Path, work_dir: Path, input_path: Path, raw_path: Path) -> None:
-    data = require_input_data(input_path)
+def is_fresh(output_path: Path, inputs: list[Path]) -> bool:
+    if not output_path.exists():
+        return False
+    output_mtime = output_path.stat().st_mtime_ns
+    return all(
+        path.exists() and path.stat().st_mtime_ns <= output_mtime for path in inputs
+    )
+
+
+def run_case(exe_path: Path, data: dict[str, Any], raw_path: Path) -> None:
     env = os.environ.copy()
     env["LLVM_PROFILE_FILE"] = str(raw_path)
-    subprocess.run(
-        [str(exe_path.resolve()), *data["argv"]],
-        input=data["stdin"].encode(),
-        capture_output=True,
-        env=env,
-        cwd=work_dir,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        temp_exe = temp_path / exe_path.name
+        shutil.copy2(exe_path, temp_exe)
+        subprocess.run(
+            [f"./{temp_exe.name}", *data["argv"]],
+            input=data["stdin"].encode(),
+            capture_output=True,
+            env=env,
+            cwd=temp_path,
+            check=False,
+        )
 
 
 def show_coverage(
@@ -134,8 +143,7 @@ def main() -> None:
     root = test_vectors_dir()
     lib_path = shared_lib_path(root)
     cases = [
-        (case_dir, validate_test_case_dir(case_dir))
-        for case_dir in test_case_dirs(root)
+        (case_dir, output_case_paths(case_dir)) for case_dir in output_case_dirs(root)
     ]
     try:
         subprocess.run(
@@ -165,77 +173,99 @@ def main() -> None:
     raw_root = cov_dir / "raw"
     data_root = cov_dir / "data"
     show_root = cov_dir / "show"
-    if cov_dir.exists():
-        shutil.rmtree(cov_dir)
-    raw_root.mkdir(parents=True)
-    data_root.mkdir()
-    show_root.mkdir()
+    raw_root.mkdir(parents=True, exist_ok=True)
+    data_root.mkdir(parents=True, exist_ok=True)
+    show_root.mkdir(parents=True, exist_ok=True)
     raw_paths: list[Path] = []
+    any_changed = False
 
     for case_dir, input_paths in cases:
         exe_path = exe_dir / case_dir.name
         if not exe_path.is_file():
             abort(f"{exe_path}: executable does not exist")
+        harness = harness_path(root, case_dir.name)
         case_raw = raw_root / case_dir.name
         case_data = data_root / case_dir.name
         case_show = show_root / case_dir.name
-        case_raw.mkdir()
-        case_data.mkdir()
-        case_show.mkdir()
-        output_dir = root / "outputs" / case_dir.name
-        if not output_dir.is_dir():
-            abort(f"{output_dir}: output directory does not exist")
-        for input_path in input_paths:
-            print(f"Running {exe_path} with input {input_path}...")
-            name = input_path.stem
+        case_raw.mkdir(exist_ok=True)
+        case_data.mkdir(exist_ok=True)
+        case_show.mkdir(exist_ok=True)
+        for output_path in input_paths:
+            data = require_case_data(output_path)
+            name = output_path.stem
             raw_path = case_raw / f"{name}.profraw"
             data_path = case_data / f"{name}.profdata"
             show_path = case_show / f"{name}.txt"
-            run_case(exe_path, case_dir, input_path, raw_path)
-            subprocess.run(
-                [
-                    "llvm-profdata-20",
-                    "merge",
-                    "-sparse",
-                    str(raw_path),
-                    "-o",
-                    str(data_path),
-                ],
-                check=True,
-            )
-            show_coverage(exe_path, lib_path, data_path, show_path)
-            output_path = output_dir / input_path.name
-            if not require_output_data(output_path)["ub"]:
+            deps = [output_path, harness, exe_path, lib_path]
+            if is_fresh(raw_path, deps):
+                print(f"Keeping {raw_path}...")
+            else:
+                print(f"Running {exe_path} with output {output_path}...")
+                run_case(exe_path, data, raw_path)
+                any_changed = True
+            if is_fresh(data_path, [raw_path]):
+                print(f"Keeping {data_path}...")
+            else:
+                subprocess.run(
+                    [
+                        "llvm-profdata-20",
+                        "merge",
+                        "-sparse",
+                        str(raw_path),
+                        "-o",
+                        str(data_path),
+                    ],
+                    check=True,
+                )
+                any_changed = True
+            if is_fresh(show_path, [data_path, exe_path, lib_path]):
+                print(f"Keeping {show_path}...")
+            else:
+                show_coverage(exe_path, lib_path, data_path, show_path)
+                any_changed = True
+            if not data["ub"]:
                 raw_paths.append(raw_path)
 
     if not raw_paths:
         abort(f"{root / 'outputs'}: no non-UB runs found")
 
     merged_path = cov_dir / "merged.profdata"
-    subprocess.run(
-        [
-            "llvm-profdata-20",
-            "merge",
-            "-sparse",
-            *map(str, raw_paths),
-            "-o",
-            str(merged_path),
-        ],
-        check=True,
-    )
-    show_coverage(None, lib_path, merged_path, cov_dir / "merged.txt")
-    with (cov_dir / "report.txt").open("w") as stdout:
+    merged_show_path = cov_dir / "merged.txt"
+    report_path = cov_dir / "report.txt"
+    if not is_fresh(merged_path, raw_paths):
         subprocess.run(
             [
-                "llvm-cov-20",
-                "report",
-                "-object",
-                str(lib_path),
-                f"-instr-profile={merged_path}",
+                "llvm-profdata-20",
+                "merge",
+                "-sparse",
+                *map(str, raw_paths),
+                "-o",
+                str(merged_path),
             ],
             check=True,
-            stdout=stdout,
         )
+        any_changed = True
+    else:
+        print(f"Keeping {merged_path}...")
+    if any_changed or not is_fresh(merged_show_path, [merged_path, lib_path]):
+        show_coverage(None, lib_path, merged_path, merged_show_path)
+    else:
+        print(f"Keeping {merged_show_path}...")
+    if any_changed or not is_fresh(report_path, [merged_path, lib_path]):
+        with report_path.open("w") as stdout:
+            subprocess.run(
+                [
+                    "llvm-cov-20",
+                    "report",
+                    "-object",
+                    str(lib_path),
+                    f"-instr-profile={merged_path}",
+                ],
+                check=True,
+                stdout=stdout,
+            )
+    else:
+        print(f"Keeping {report_path}...")
 
 
 if __name__ == "__main__":
