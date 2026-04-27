@@ -17,6 +17,5 @@
 
 # Current Capabilities
 
-* Test vector generation and translation for single-executable test cases
-* Test vector generation without translation for single-shared-library test
-  cases
+* Test vector generation and translation for single-executable or
+  single-shared-library test cases
